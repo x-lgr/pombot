@@ -117,6 +117,8 @@ def init_db() -> None:
                 price INTEGER NOT NULL,
                 description TEXT NOT NULL,
                 duration TEXT,
+                image_file_id TEXT,
+                button_url TEXT,
                 sort_order INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS discounts (
@@ -188,6 +190,14 @@ def init_db() -> None:
             )
         try:
             conn.execute("ALTER TABLE users ADD COLUMN age_verified INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE plans ADD COLUMN image_file_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE plans ADD COLUMN button_url TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -295,8 +305,13 @@ def plans_keyboard() -> InlineKeyboardMarkup:
         plans = conn.execute(
             "SELECT id, name FROM plans ORDER BY sort_order, id"
         ).fetchall()
-    rows = [[InlineKeyboardButton(p["name"], callback_data=f"plan:{p['id']}")] for p in plans]
-    rows.append([InlineKeyboardButton("🔴 Back", callback_data="back:start")])
+    buttons = [InlineKeyboardButton(p["name"], callback_data=f"plan:{p['id']}") for p in plans]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    back_button = InlineKeyboardButton("🔴 Back", callback_data="back:start")
+    if len(buttons) % 2 == 1 and rows:
+        rows[-1].append(back_button)
+    else:
+        rows.append([back_button])
     return InlineKeyboardMarkup(rows)
 
 
@@ -515,6 +530,10 @@ def parse_price(value: str) -> Optional[int]:
     return int(match.group(0)) if match else None
 
 
+def is_skip_value(value: str) -> bool:
+    return value.strip().lower() in {"-", "skip", "nochange", "no change"}
+
+
 async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     if not text.startswith("??"):
@@ -550,6 +569,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "plans": lambda: list_plans(update),
         "removeplan": lambda: begin_remove_plan(update, context),
         "editplan": lambda: begin_edit_plan(update, context),
+        "setplanurl": lambda: set_plan_url_arg_or_wizard(update, context, arg),
         "setupi": lambda: set_arg_or_wizard(update, context, arg, "upi_id", "Send UPI ID."),
         "setupiname": lambda: set_arg_or_wizard(update, context, arg, "upiname", "Send UPI name."),
         "setreceivername": lambda: set_arg_or_wizard(update, context, arg, "receiver_name", "Send receiver name."),
@@ -632,6 +652,14 @@ async def set_url_arg_or_wizard(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(prompt)
 
 
+async def set_plan_url_arg_or_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str) -> None:
+    if arg:
+        await update.message.reply_text("Use ??editplan to edit plan button_url.")
+        return
+    context.user_data["wizard"] = {"name": "set_plan_url", "step": "plan_id"}
+    await update.message.reply_text("Send plan ID.")
+
+
 async def view_start_image(update: Update) -> None:
     image_id = get_setting("start_image_file_id")
     if not image_id:
@@ -696,7 +724,11 @@ async def begin_remove_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def begin_edit_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await list_plans(update)
     context.user_data["wizard"] = {"name": "editplan", "step": "id"}
-    await update.message.reply_text("Send plan ID to edit.")
+    await update.message.reply_text(
+        "Send plan ID to edit.\n\n"
+        "During editing, you can type '-' or 'skip' at any step to keep the current value.\n"
+        "For images, you can type 'remove' to delete the current image."
+    )
 
 
 async def begin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -754,7 +786,7 @@ async def admin_help(update: Update) -> None:
         "??setdemourl - Demo button URL set karein\n\n"
         "Plans\n"
         "??addplan - Premium plan create karein\n"
-        "??editplan - Existing plan edit karein\n"
+        "??editplan - Existing plan edit karein (use '-' or 'skip' to keep current values)\n"
         "??removeplan - Plan delete karein\n"
         "??plans - Sab plans list karein\n\n"
         "Payment Settings\n"
@@ -922,6 +954,8 @@ async def wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         set_setting(wizard["key"], text.strip())
         context.user_data.pop("wizard", None)
         await update.message.reply_text("Saved.")
+    elif name == "set_plan_url":
+        await set_plan_url_step(update, context, text)
     elif name == "addbutton":
         await addbutton_step(update, context, text)
     elif name == "removebutton":
@@ -938,6 +972,28 @@ async def wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await broadcast_text_step(update, context, text)
     elif name == "broadcast_button":
         await broadcast_button_step(update, context, text)
+
+
+async def set_plan_url_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    wizard = context.user_data["wizard"]
+    if wizard["step"] == "plan_id":
+        if not text.isdigit():
+            await update.message.reply_text("Send a numeric plan ID.")
+            return
+        wizard["plan_id"] = int(text)
+        wizard["step"] = "url"
+        await update.message.reply_text("Send button URL for this plan.")
+    else:
+        if not valid_url(text):
+            await update.message.reply_text("❌ Invalid URL.")
+            return
+        with db() as conn:
+            conn.execute(
+                "UPDATE plans SET button_url = ? WHERE id = ?",
+                (text.strip(), wizard["plan_id"]),
+            )
+        context.user_data.pop("wizard", None)
+        await update.message.reply_text("Plan button URL saved.")
 
 
 async def addbutton_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -1024,14 +1080,28 @@ async def addplan_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         await update.message.reply_text("Send duration, or type - to skip.")
     elif step == "duration":
         data["duration"] = "" if text.strip() == "-" else text.strip()
+        wizard["step"] = "image"
+        await update.message.reply_text("Send plan image, or type - to skip.")
+    elif step == "image":
+        if text.strip() != "-":
+            await update.message.reply_text("Please send a photo, or type - to skip.")
+            return
+        data["image_file_id"] = ""
         wizard["step"] = "sort_order"
         await update.message.reply_text("Send sort order.")
     else:
         sort_order = parse_price(text) or 0
         with db() as conn:
             conn.execute(
-                "INSERT INTO plans(name, price, description, duration, sort_order) VALUES(?, ?, ?, ?, ?)",
-                (data["name"], data["price"], data["description"], data["duration"], sort_order),
+                "INSERT INTO plans(name, price, description, duration, image_file_id, sort_order) VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    data["name"],
+                    data["price"],
+                    data["description"],
+                    data["duration"],
+                    data.get("image_file_id", ""),
+                    sort_order,
+                ),
             )
         context.user_data.pop("wizard", None)
         await update.message.reply_text("Plan saved.")
@@ -1040,49 +1110,99 @@ async def addplan_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 async def editplan_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     wizard = context.user_data["wizard"]
     data = wizard.setdefault("data", {})
+    
     if wizard["step"] == "id":
         if not text.isdigit():
             await update.message.reply_text("Send a numeric plan ID.")
             return
         plan_id = int(text)
         with db() as conn:
-            exists = conn.execute("SELECT 1 FROM plans WHERE id = ?", (plan_id,)).fetchone()
-        if not exists:
+            plan = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not plan:
             await update.message.reply_text("Plan not found. Send a valid plan ID.")
             return
         wizard["id"] = plan_id
+        # Store original plan data for reference
+        wizard["original"] = dict(plan)
         wizard["step"] = "name"
-        await update.message.reply_text("Send new plan name.")
+        await update.message.reply_text(
+            f"Current name: {plan['name']}\n"
+            "Send new plan name, or type '-' / 'skip' to keep current."
+        )
     elif wizard["step"] == "name":
-        if not text.strip():
-            await update.message.reply_text("Plan name cannot be empty.")
-            return
-        data["name"] = text.strip()
+        if is_skip_value(text):
+            data["name"] = wizard["original"]["name"]
+        else:
+            if not text.strip():
+                await update.message.reply_text("Plan name cannot be empty. Send '-' to skip.")
+                return
+            data["name"] = text.strip()
         wizard["step"] = "price"
-        await update.message.reply_text("Send new price.")
+        await update.message.reply_text(
+            f"Current price: ₹{wizard['original']['price']}\n"
+            "Send new price, or type '-' / 'skip' to keep current."
+        )
     elif wizard["step"] == "price":
-        price = parse_price(text)
-        if not price:
-            await update.message.reply_text("Send a valid numeric price.")
-            return
-        data["price"] = price
+        if is_skip_value(text):
+            data["price"] = wizard["original"]["price"]
+        else:
+            price = parse_price(text)
+            if not price:
+                await update.message.reply_text("Send a valid numeric price, or '-' to skip.")
+                return
+            data["price"] = price
         wizard["step"] = "description"
-        await update.message.reply_text("Send new description.")
+        await update.message.reply_text(
+            f"Current description: {wizard['original']['description']}\n"
+            "Send new description, or type '-' / 'skip' to keep current."
+        )
     elif wizard["step"] == "description":
-        data["description"] = text
+        if is_skip_value(text):
+            data["description"] = wizard["original"]["description"]
+        else:
+            data["description"] = text
         wizard["step"] = "duration"
-        await update.message.reply_text("Send new duration, or type - to skip.")
+        await update.message.reply_text(
+            f"Current duration: {wizard['original']['duration'] or 'Not set'}\n"
+            "Send new duration, or type '-' / 'skip' to keep current."
+        )
     elif wizard["step"] == "duration":
-        data["duration"] = "" if text.strip() == "-" else text.strip()
+        if is_skip_value(text):
+            data["duration"] = wizard["original"]["duration"] or ""
+        else:
+            data["duration"] = "" if text.strip() == "remove" else text.strip()
+        wizard["step"] = "image"
+        await update.message.reply_text(
+            "Send new plan image (photo), or type '-' / 'skip' to keep current image,\n"
+            "or type 'remove' to delete current image."
+        )
+    elif wizard["step"] == "image":
+        if is_skip_value(text):
+            data["image_file_id"] = wizard["original"]["image_file_id"] or ""
+        elif text.strip().lower() == "remove":
+            data["image_file_id"] = ""
+        else:
+            # This will be handled by photo upload
+            if text.strip():
+                await update.message.reply_text("Please send a photo, or type '-' to skip, 'remove' to delete.")
+                return
+            return
         wizard["step"] = "sort_order"
-        await update.message.reply_text("Send new sort order.")
-    else:
-        data["sort_order"] = parse_price(text) or 0
+        await update.message.reply_text(
+            f"Current sort order: {wizard['original']['sort_order']}\n"
+            "Send new sort order, or type '-' / 'skip' to keep current."
+        )
+    elif wizard["step"] == "sort_order":
+        if is_skip_value(text):
+            data["sort_order"] = wizard["original"]["sort_order"]
+        else:
+            data["sort_order"] = parse_price(text) or 0
+        # Final step - update the plan
         with db() as conn:
             conn.execute(
                 """
                 UPDATE plans
-                SET name = ?, price = ?, description = ?, duration = ?, sort_order = ?
+                SET name = ?, price = ?, description = ?, duration = ?, image_file_id = ?, sort_order = ?
                 WHERE id = ?
                 """,
                 (
@@ -1090,12 +1210,14 @@ async def editplan_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text
                     data["price"],
                     data["description"],
                     data["duration"],
+                    data.get("image_file_id", ""),
                     data["sort_order"],
                     wizard["id"],
                 ),
             )
         context.user_data.pop("wizard", None)
-        await update.message.reply_text("Plan updated.")
+        context.user_data.pop("original", None)
+        await update.message.reply_text("Plan updated successfully!")
 
 
 async def broadcast_button_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -1133,6 +1255,18 @@ async def wizard_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         set_setting("start_image_file_id", photo.file_id)
         context.user_data.pop("wizard", None)
         await update.message.reply_text("Start image saved.")
+    elif wizard["name"] in {"addplan", "editplan"} and wizard.get("step") == "image":
+        if not update.message.photo:
+            await update.message.reply_text("Please send a valid photo, or type - to skip, remove to delete.")
+            return
+        data = wizard.setdefault("data", {})
+        data["image_file_id"] = update.message.photo[-1].file_id
+        wizard["step"] = "sort_order"
+        if wizard["name"] == "addplan":
+            prompt = "Send sort order."
+        else:
+            prompt = f"Current sort order: {wizard['original']['sort_order']}\nSend new sort order, or type '-' / 'skip' to keep current."
+        await update.message.reply_text(prompt)
     elif wizard["name"] == "broadcast":
         context.user_data["broadcast"] = {
             "type": "photo",
@@ -1265,18 +1399,22 @@ async def show_plan(query: Any, plan_id: int) -> None:
     if not plan:
         await query.message.reply_text("Plan not found.")
         return
-    await query.message.reply_text(
+    plan_text = (
         f"{plan['name']}\n"
         f"Price: ₹{plan['price']}\n"
         f"Description: {plan['description']}\n"
-        f"Benefits: {plan['duration'] or 'Premium access'}",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🟢 Buy Now", callback_data=f"paypage:{plan_id}")],
-                [InlineKeyboardButton("🔴 Back", callback_data="buy")],
-            ]
-        ),
+        f"Benefits: {plan['duration'] or 'Premium access'}"
     )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🟢 Buy Now", callback_data=f"paypage:{plan_id}")],
+            [InlineKeyboardButton("🔴 Back", callback_data="buy")],
+        ]
+    )
+    if plan["image_file_id"]:
+        await send_photo_with_format_fallback(query.message, plan["image_file_id"], plan_text, keyboard)
+    else:
+        await query.message.reply_text(plan_text, reply_markup=keyboard)
 
 
 def latest_discount(user_id: int, plan_id: int) -> Optional[sqlite3.Row]:
