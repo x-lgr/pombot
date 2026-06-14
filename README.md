@@ -1,4 +1,3 @@
-```markdown
 # 📱 Telegram Premium Bot - Complete Documentation
 
 <div align="center">
